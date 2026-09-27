@@ -1,3 +1,5 @@
+extern crate alloc;
+
 use crate::process::current_proc;
 use crate::screen::SCREEN;
 use core::fmt::Formatter;
@@ -8,6 +10,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::lazy_lock::LazyLock;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, Ticker, with_timeout};
+use terminal_model::key_dispatch::{PttAction, PttTransition, ptt_action};
 
 static BATTERY_PCT: AtomicU8 = AtomicU8::new(0xff);
 
@@ -39,7 +42,7 @@ impl From<u8> for KeyState {
             1 => Self::Pressed,
             2 => Self::Hold,
             3 => Self::Released,
-            0 | _ => Self::Idle,
+            _ => Self::Idle,
         }
     }
 }
@@ -88,6 +91,7 @@ pub enum Key {
     F8,
     F9,
     F10,
+    Power,
     Char(char),
     Other(u8),
 }
@@ -136,6 +140,11 @@ impl From<u8> for Key {
             0x88 => Self::F8,
             0x89 => Self::F9,
             0x90 => Self::F10,
+            // Short press of the physical power button - reported by the keyboard
+            // co-processor's PMU as an ordinary key over the same I2C FIFO. A long
+            // press is handled entirely inside the co-processor (PMU.shutdown())
+            // and never reaches the host.
+            0x91 => Self::Power,
             _ => match char::from_u32(k as u32) {
                 Some(c) => Self::Char(c),
                 None => Self::Other(k),
@@ -169,6 +178,19 @@ pub struct KeyBoardState {
     modifiers: Modifiers,
 }
 
+/// Maps a modifier key to the Modifiers flag it controls, or None if
+/// the key is not a modifier.
+fn modifier_flag(key: Key) -> Option<Modifiers> {
+    match key {
+        Key::ModAlt => Some(Modifiers::ALT),
+        Key::ModControl => Some(Modifiers::CTRL),
+        Key::ModShiftLeft => Some(Modifiers::LSHIFT),
+        Key::ModShiftRight => Some(Modifiers::RSHIFT),
+        Key::ModSymbol => Some(Modifiers::SYM),
+        _ => None,
+    }
+}
+
 impl KeyBoardState {
     pub async fn process(&mut self) -> Option<KeyReport> {
         let key = read_keyboard().await.ok()?;
@@ -180,20 +202,10 @@ impl KeyBoardState {
         let (state, key) = key;
         match (state, key) {
             (KeyState::Idle, Key::None) => return None,
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModAlt) => {
-                self.modifiers.set(Modifiers::ALT, s == KeyState::Hold);
-            }
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModControl) => {
-                self.modifiers.set(Modifiers::CTRL, s == KeyState::Hold);
-            }
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModShiftLeft) => {
-                self.modifiers.set(Modifiers::LSHIFT, s == KeyState::Hold);
-            }
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModShiftRight) => {
-                self.modifiers.set(Modifiers::RSHIFT, s == KeyState::Hold);
-            }
-            (s @ KeyState::Hold | s @ KeyState::Released, Key::ModSymbol) => {
-                self.modifiers.set(Modifiers::SYM, s == KeyState::Hold);
+            (s @ (KeyState::Hold | KeyState::Released), key) => {
+                if let Some(flag) = modifier_flag(key) {
+                    self.modifiers.set(flag, s == KeyState::Hold);
+                }
             }
             _ => {}
         }
@@ -205,57 +217,46 @@ impl KeyBoardState {
     }
 }
 
+async fn write_reg(reg: u8, value: u8) {
+    let mut i2c_bus = I2C.get().lock().await;
+    let i2c_bus = i2c_bus.as_mut().expect("bus configured");
+    let _ = i2c_bus
+        .write_async(KBD_ADDR, [reg | REG_WRITE, value])
+        .await;
+}
+
+async fn read_reg(reg: u8) -> Result<u8, embassy_rp::i2c::Error> {
+    let mut i2c_bus = I2C.get().lock().await;
+    let i2c_bus = i2c_bus.as_mut().expect("bus configured");
+    let mut buf = [0u8; 2];
+    i2c_bus.write_read_async(KBD_ADDR, [reg], &mut buf).await?;
+    Ok(buf[1])
+}
+
 /// Control the lcd backlight brightness level.
 /// The firmware uses the value as a pwm signal at 10_000 Hz.
 /// https://github.com/clockworkpi/PicoCalc/blob/939b9bbad9030655a35ff07062024691abb12240/Code/picocalc_keyboard/backlight.ino#L20-L31
 pub async fn set_lcd_backlight(level: u8) {
-    let mut i2c_bus = I2C.get().lock().await;
-    let i2c_bus = i2c_bus.as_mut().expect("bus configured");
-    let _ = i2c_bus
-        .write_async(KBD_ADDR, [REG_ID_BKL | REG_WRITE, level])
-        .await;
+    write_reg(REG_ID_BKL, level).await;
 }
 
 pub async fn get_lcd_backlight() -> Result<u8, embassy_rp::i2c::Error> {
-    let mut i2c_bus = I2C.get().lock().await;
-    let i2c_bus = i2c_bus.as_mut().expect("bus configured");
-    let mut buf = [0u8; 2];
-    i2c_bus
-        .write_read_async(KBD_ADDR, [REG_ID_BKL], &mut buf)
-        .await?;
-    Ok(buf[1])
+    read_reg(REG_ID_BKL).await
 }
 
 /// Control the keyboard backlight brightness level.
 /// The firmware uses the value as a pwm signal at 10_000 Hz.
 /// Values < 20 turn off the keyboard backlight
 pub async fn set_keyboard_backlight(level: u8) {
-    let mut i2c_bus = I2C.get().lock().await;
-    let i2c_bus = i2c_bus.as_mut().expect("bus configured");
-    let _ = i2c_bus
-        .write_async(KBD_ADDR, [REG_ID_BK2 | REG_WRITE, level])
-        .await;
+    write_reg(REG_ID_BK2, level).await;
 }
 
 pub async fn get_keyboard_backlight() -> Result<u8, embassy_rp::i2c::Error> {
-    let mut i2c_bus = I2C.get().lock().await;
-    let i2c_bus = i2c_bus.as_mut().expect("bus configured");
-    let mut buf = [0u8; 2];
-    i2c_bus
-        .write_read_async(KBD_ADDR, [REG_ID_BK2], &mut buf)
-        .await?;
-    Ok(buf[1])
+    read_reg(REG_ID_BK2).await
 }
 
 async fn read_battery_pct() -> Result<u8, embassy_rp::i2c::Error> {
-    let mut i2c_bus = I2C.get().lock().await;
-    let i2c_bus = i2c_bus.as_mut().expect("bus configured");
-    let mut buf = [0u8; 2];
-    i2c_bus
-        .write_read_async(KBD_ADDR, [REG_ID_BAT], &mut buf)
-        .await?;
-
-    Ok(buf[1])
+    read_reg(REG_ID_BAT).await
 }
 
 async fn read_keyboard() -> Result<(KeyState, Key), embassy_rp::i2c::Error> {
@@ -328,7 +329,35 @@ pub async fn keyboard_reader(
 
         if let Some(key) = keyboard.process().await {
             log::info!("key == {key:?}");
-            if key.state == KeyState::Pressed {
+            // Push-to-talk: hold plain F1 (no modifiers) to record; release
+            // to send. Arming and stopping are deliberately independent
+            // checks, implemented by `terminal_model::key_dispatch::ptt_action`
+            // so the decision table can be unit-tested off-target. Arming
+            // requires no modifiers, so Ctrl+F1 falls through to the reboot
+            // shortcut below instead of starting a recording. Stopping only
+            // requires that a recording is active - it does not re-check
+            // modifiers, because a Released report for F1 must always end the
+            // recording regardless of what modifiers are held at that instant
+            // (e.g. Ctrl pressed while F1 was already down). Relies on the same
+            // reliable `Hold`/`Released` state reporting that `modifier_flag`
+            // above already depends on; rebinding to a different key means
+            // changing the `Key::F1` check passed to `ptt_action` here.
+            let transition = match key.state {
+                KeyState::Pressed => PttTransition::Pressed,
+                KeyState::Released => PttTransition::Released,
+                KeyState::Idle | KeyState::Hold => PttTransition::Other,
+            };
+            let ptt = ptt_action(
+                key.key == Key::F1,
+                transition,
+                key.modifiers == Modifiers::NONE,
+                crate::mic::is_recording(),
+            );
+            if ptt == PttAction::Start {
+                crate::mic::start_recording().await;
+            } else if ptt == PttAction::Stop {
+                crate::mic::stop_recording().await;
+            } else if key.state == KeyState::Pressed {
                 match key.key {
                     Key::F5 if key.modifiers == Modifiers::CTRL => {
                         reboot_bootsel();
@@ -357,13 +386,22 @@ pub async fn keyboard_reader(
                     Key::Down if key.modifiers == Modifiers::CTRL => {
                         SCREEN.get().lock().await.scroll_view_down(1);
                     }
+                    Key::Power => {
+                        let bat = get_battery();
+                        SCREEN
+                            .get()
+                            .lock()
+                            .await
+                            .show_battery_overlay(alloc::format!("Battery: {bat}"));
+                    }
                     _ => {
                         let proc = current_proc();
-                        if let Err(_) = with_timeout(Duration::from_millis(100), async {
+                        if with_timeout(Duration::from_millis(100), async {
                             proc.key_input(key).await;
                             proc.render().await;
                         })
                         .await
+                        .is_err()
                         {
                             log::info!("timeout sending key to proc {}", proc.name());
                         }

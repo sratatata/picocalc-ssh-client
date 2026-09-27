@@ -32,24 +32,26 @@ fn getrandom_custom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
     Ok(())
 }
 
+/// Locks the global Trng and runs `f` against it.
+fn with_rng<T>(f: impl FnOnce(&mut Trng<TRNG>) -> T) -> T {
+    let mut rng = RNG.try_get().unwrap().try_lock().unwrap();
+    f(&mut rng)
+}
+
 /// Our Rng type. It internally manages mutual exclusion around
 /// the underlying TRNG hardware.
 pub struct PicoRng;
 impl rand_core::RngCore for PicoRng {
     fn next_u32(&mut self) -> u32 {
-        RNG.try_get().unwrap().try_lock().unwrap().next_u32()
+        with_rng(|rng| rng.next_u32())
     }
     fn next_u64(&mut self) -> u64 {
-        RNG.try_get().unwrap().try_lock().unwrap().next_u64()
+        with_rng(|rng| rng.next_u64())
     }
     fn fill_bytes(&mut self, buf: &mut [u8]) {
-        rand_core::RngCore::fill_bytes(&mut *RNG.try_get().unwrap().try_lock().unwrap(), buf)
+        with_rng(|rng| rand_core::RngCore::fill_bytes(rng, buf))
     }
     fn try_fill_bytes(&mut self, buf: &mut [u8]) -> Result<(), rand_core::Error> {
-        RNG.try_get()
-            .unwrap()
-            .try_lock()
-            .unwrap()
-            .try_fill_bytes(buf)
+        with_rng(|rng| rng.try_fill_bytes(buf))
     }
 }

@@ -33,6 +33,13 @@ impl Region {
             size: AtomicUsize::new(size),
         }
     }
+
+    fn load(&self) -> (usize, usize) {
+        (
+            self.start.load(Ordering::SeqCst),
+            self.size.load(Ordering::SeqCst),
+        )
+    }
 }
 
 /// This is an allocator that combines two regions of memory.
@@ -59,8 +66,7 @@ impl DualHeap {
     }
 
     unsafe fn add_primary(&self, region: Region) {
-        let start = region.start.load(Ordering::SeqCst);
-        let size = region.size.load(Ordering::SeqCst);
+        let (start, size) = region.load();
         unsafe {
             self.primary.init(start, size);
         }
@@ -69,8 +75,7 @@ impl DualHeap {
     }
 
     unsafe fn add_secondary(&self, region: Region) {
-        let start = region.start.load(Ordering::SeqCst);
-        let size = region.size.load(Ordering::SeqCst);
+        let (start, size) = region.load();
         unsafe {
             self.secondary.init(start, size);
         }
@@ -118,25 +123,17 @@ pub fn init_qmi_psram_heap(size: u32) {
     unsafe { HEAP.add_secondary(Region::new(0x11000000, size as usize)) }
 }
 
+async fn print_heap_line(name: &str, used: usize, free: usize) {
+    let total = used + free;
+    print!("{name:<10} {total:>10} {used:>10} {free:>10}\r\n");
+}
+
 pub async fn free_command(_args: &[&str]) {
     print!(
         "{:<10} {:>10} {:>10} {:>10}\r\n",
         "", "TOTAL", "USED", "FREE"
     );
 
-    let ram_used = HEAP.primary.used();
-    let ram_free = HEAP.primary.free();
-    let ram_total = ram_used + ram_free;
-    print!(
-        "{:<10} {ram_total:>10} {ram_used:>10} {ram_free:>10}\r\n",
-        "RAM"
-    );
-
-    let qmi_used = HEAP.secondary.used();
-    let qmi_free = HEAP.secondary.free();
-    let qmi_total = qmi_used + qmi_free;
-    print!(
-        "{:<10} {qmi_total:>10} {qmi_used:>10} {qmi_free:>10}\r\n",
-        "PSRAM (QMI)"
-    );
+    print_heap_line("RAM", HEAP.primary.used(), HEAP.primary.free()).await;
+    print_heap_line("PSRAM (QMI)", HEAP.secondary.used(), HEAP.secondary.free()).await;
 }

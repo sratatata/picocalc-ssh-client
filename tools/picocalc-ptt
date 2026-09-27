@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+"""Transcribe PicoCalc push-to-talk audio and type the text into a tmux pane.
+
+This is the server half of the firmware's push-to-talk feature. The PicoCalc
+opens a *second channel* on the SSH connection it already has, execs this
+command on it, and writes microphone audio to the channel's stdin. No new
+listening port, no new service, no extra credential: everything rides the
+session the device already authenticated.
+
+Protocol (authoritative encoder: ``terminal_model/src/ptt_frame.rs``):
+
+* stdin carries audio frames: a 4-byte little-endian byte count followed by
+  that many bytes of signed 16-bit little-endian mono PCM at ``--rate``
+  (default 16000, matching the device's default ``ptt_rate``). Nothing on the
+  wire says which rate the device used, so a non-default ``ptt_rate`` needs a
+  matching ``--rate`` here.
+* a frame with a byte count of zero ends one utterance: the audio buffered so
+  far is transcribed and typed, and the next utterance begins.
+* EOF ends the session. Any audio still buffered is transcribed and typed too,
+  so an abruptly dropped session still delivers the words that made it, and
+  then the helper exits.
+
+One helper process runs per SSH session for as long as that session lasts. The
+device resolves the command it execs (``ptt_ssh_cmd``) once, when the session
+starts, and its console splits that setting on single spaces with no quote
+handling - so extra options are configured unquoted and word by word, with the
+whole value capped at 128 bytes.
+
+Configuration, in increasing priority: this file's defaults, a config file
+(``--config``, else ``$PICOCALC_PTT_CONFIG``, else
+``$XDG_CONFIG_HOME/picocalc-ptt.conf`` or ``~/.config/picocalc-ptt.conf``),
+environment variables, then command-line flags. The config file is ``key = value``
+lines with ``#`` comments, using the long option names
+(``whisper``, ``tmux_target``, ``tmux_socket``, ``enter``, ``rate``,
+``timeout``, ``log``)::
+
+    # ~/.config/picocalc-ptt.conf
+    whisper = whisper-cli -m ~/models/ggml-base.en.bin -f %wav -nt -np
+    tmux_target = work
+    tmux_socket = /run/user/1000/tmux-1000/default
+    enter = no
+
+The tmux calls run with tmux's own default socket unless ``tmux_socket`` (or
+``--tmux-socket``, or ``$PICOCALC_PTT_TMUX_SOCKET``) names one, in which case
+they use ``tmux -S <path>``. This session's SSH channel does *not* inherit the
+interactive login's ``TMUX``/``TMUX_TMPDIR``, so a tmux server started with a
+non-default socket directory is invisible to it: run ``tmux display-message -p
+'#{socket_path}'`` inside your session to see the socket path to configure.
+``TMUX_TMPDIR`` set in this process's environment is honoured by tmux itself.
+
+The whisper command is run through ``/bin/sh`` with ``%wav`` replaced by the
+capture's WAV path and ``%dir`` by the private working directory. If it has no
+``%wav``, the WAV path is appended as a final argument. Its transcript is taken
+from its standard output if that is not empty, and otherwise from
+``%dir/picocalc-ptt.txt`` - which is what both ``whisper-cli -of %dir/picocalc-ptt``
+and ``whisper --output_dir %dir`` write. Both the standard output and the
+standard error of the whisper command are captured, so a progress bar can
+never flood the SSH channel back to the device.
+
+Requirements: Python 3.8+, whisper and tmux on the server, and nothing else -
+only the standard library is used, so there is nothing to install with pip. A
+default setup needs no configuration at all: with no ``whisper`` configured the
+helper runs ``whisper-cli`` with the first model it finds (see
+``MODEL_CANDIDATES``, or point ``$PICOCALC_PTT_MODEL`` at yours), or falls back
+to ``openai-whisper``, which downloads the ``base`` model itself. The config
+file below is purely for overrides.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import wave
+from pathlib import Path
+
+PROGRAM = "picocalc-ptt"
+#: Bytes in the little-endian byte count that prefixes every audio frame.
+FRAME_PREFIX_BYTES = 4
+#: Name of the WAV this helper writes for the whisper command to read.
+WAV_NAME = "picocalc-ptt.wav"
+#: Default sample rate: the firmware's default ``ptt_rate``.
+DEFAULT_RATE = 16000
+#: How long a single transcription may take before it is abandoned.
+DEFAULT_TIMEOUT = 120.0
+#: Longest utterance to buffer: the firmware caps a recording at 60 s, so
+#: anything beyond this is a protocol error, and refusing it keeps a broken or
+#: hostile stream from growing this process without bound.
+MAX_UTTERANCE_SECONDS = 90.0
+#: Model paths a `whisper-cli` (whisper.cpp) setup conventionally uses. With no
+#: `whisper` configured, the helper takes the first of these that exists, so a
+#: default install needs no configuration.
+MODEL_CANDIDATES = (
+    "~/models/ggml-base.en.bin",
+    "~/models/ggml-base.bin",
+    "~/.cache/whisper/ggml-base.en.bin",
+    "~/.cache/whisper/ggml-base.bin",
+    "~/.local/share/whisper/ggml-base.en.bin",
+    "/usr/share/whisper/ggml-base.en.bin",
+    "/usr/local/share/whisper/ggml-base.en.bin",
+)
+#: Glob tried after the exact candidates, so a differently-named download in
+#: the usual models directory still works.
+MODEL_GLOBS = ("~/models/ggml-*.bin",)
+#: Environment variable naming the model explicitly, overriding discovery.
+MODEL_ENV = "PICOCALC_PTT_MODEL"
+
+
+def find_model() -> str | None:
+    """The whisper.cpp model to use when none is configured: the explicit
+    ``$PICOCALC_PTT_MODEL``, else the first conventional path that exists, else
+    the first ``ggml-*.bin`` in the usual models directory."""
+    explicit = os.environ.get(MODEL_ENV)
+    if explicit:
+        return explicit
+    for candidate in MODEL_CANDIDATES:
+        path = Path(candidate).expanduser()
+        if path.is_file():
+            return str(path)
+    for pattern in MODEL_GLOBS:
+        expanded = Path(os.path.expanduser(pattern))
+        found = sorted(expanded.parent.glob(expanded.name))
+        if found:
+            return str(found[0])
+    return None
+
+
+def default_whisper_command() -> str | None:
+    """The whisper command to run when the user configured none, or ``None``
+    when this server has no whisper the helper knows how to drive.
+
+    `whisper-cli` (whisper.cpp) needs a model path, so it is only used when one
+    is found; `openai-whisper`'s ``--model base`` downloads its own model on
+    first use, so it needs nothing.
+    """
+    model = find_model()
+    if model and shutil.which("whisper-cli"):
+        return f"whisper-cli -m {shlex.quote(model)} -f %wav -nt -np"
+    if shutil.which("whisper"):
+        return "whisper %wav --model base --output_format txt --output_dir %dir"
+    return None
+
+DEFAULTS = {
+    "whisper": None,
+    "tmux_target": None,
+    "tmux_socket": None,
+    "enter": False,
+    "rate": DEFAULT_RATE,
+    "timeout": DEFAULT_TIMEOUT,
+    "log": None,
+}
+ENV_KEYS = {
+    "whisper": "PICOCALC_PTT_WHISPER",
+    "tmux_target": "PICOCALC_PTT_TMUX",
+    "tmux_socket": "PICOCALC_PTT_TMUX_SOCKET",
+    "enter": "PICOCALC_PTT_ENTER",
+    "rate": "PICOCALC_PTT_RATE",
+    "timeout": "PICOCALC_PTT_TIMEOUT",
+    "log": "PICOCALC_PTT_LOG",
+}
+
+
+class Config:
+    """Resolved settings, plus the log sink they select."""
+
+    def __init__(self, values: dict, log_path):
+        self.whisper = values["whisper"]
+        self.tmux_target = values["tmux_target"]
+        # As configured (`tmux_socket`/`--tmux-socket`/env), and as resolved at
+        # startup by `start_tmux` (which may find the server on another
+        # socket); "" means "let tmux use its own default".
+        self.tmux_socket = values["tmux_socket"]
+        self.tmux_socket_used = ""
+        self.enter = bool(values["enter"])
+        self.rate = int(values["rate"])
+        self.timeout = float(values["timeout"])
+        self.log_path = log_path
+        if self.rate <= 0:
+            raise ValueError("rate must be positive")
+        if self.whisper is None:
+            # Nothing configured: drive whatever whisper this server has, so a
+            # default setup (whisper-cli + a model, or openai-whisper) needs no
+            # configuration at all.
+            self.whisper = default_whisper_command()
+        if self.whisper is None:
+            raise ValueError(
+                "no whisper command found: install whisper-cli with a model "
+                f"(set ${MODEL_ENV} or put one in ~/models), or openai-whisper; "
+                f"or set `whisper = ...` in ~/.config/{PROGRAM}.conf "
+                "($PICOCALC_PTT_WHISPER, or --whisper)"
+            )
+
+    def log(self, message: str) -> None:
+        """Report one line to the device (over the SSH channel's stderr) and
+        to the log file, if one is configured."""
+        line = f"{PROGRAM}: {message}"
+        print(line, file=sys.stderr, flush=True)
+        if self.log_path is not None:
+            try:
+                with open(self.log_path, "a", encoding="utf-8") as handle:
+                    handle.write(f"{line}\n")
+            except OSError as err:
+                # A log file that cannot be written must not break dictation.
+                print(f"{PROGRAM}: cannot write log: {err}", file=sys.stderr, flush=True)
+                self.log_path = None
+
+
+def parse_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "yes", "true", "on")
+
+
+def parse_config_file(path: Path) -> dict:
+    """Read ``key = value`` lines; unknown keys and malformed lines are
+    reported rather than ignored silently."""
+    values = {}
+    if not path.is_file():
+        return values
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if not separator or key not in DEFAULTS:
+            print(
+                f"{PROGRAM}: {path}:{number}: ignoring `{line}`",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
+        values[key] = value.strip()
+    return values
+
+
+def resolve_config(args) -> Config:
+    values = dict(DEFAULTS)
+    config_path = args.config or os.environ.get("PICOCALC_PTT_CONFIG")
+    if config_path is None:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+            os.path.expanduser("~"), ".config"
+        )
+        config_path = os.path.join(base, f"{PROGRAM}.conf")
+    values.update(parse_config_file(Path(config_path)))
+    for key, env_name in ENV_KEYS.items():
+        if os.environ.get(env_name):
+            values[key] = os.environ[env_name]
+    for key in DEFAULTS:
+        flag = getattr(args, key)
+        if flag is not None:
+            values[key] = flag
+    values["enter"] = parse_bool(values["enter"])
+    return Config(values, values["log"])
+
+
+def read_utterances(stream, limit_bytes: int, log):
+    """Yield one complete utterance's audio at a time, as ``bytes``.
+
+    A zero-length frame ends an utterance; EOF also flushes whatever is
+    buffered (a truncated final frame keeps the bytes that did arrive, since
+    losing the tail of a sentence is better than losing the sentence). Empty
+    utterances produce nothing at all - a recording with no audio in it is a
+    button press, not something to report.
+    """
+    pending = bytearray()
+    dropping = False
+    while True:
+        prefix = stream.read(FRAME_PREFIX_BYTES)
+        if len(prefix) < FRAME_PREFIX_BYTES:
+            if pending and not dropping:
+                yield bytes(pending)
+            return
+        size = int.from_bytes(prefix, "little")
+        if size == 0:
+            if pending and not dropping:
+                yield bytes(pending)
+            pending = bytearray()
+            dropping = False
+            continue
+        if size > limit_bytes:
+            # No real capture could produce this length: a protocol error we
+            # cannot trust, so the payload is discarded rather than buffered,
+            # which also keeps the stream aligned for the next utterance.
+            if not dropping:
+                log(f"frame of {size} bytes is longer than an utterance, dropping it")
+                dropping = True
+            skip = size
+            while skip > 0:
+                block = stream.read(min(skip, 65536))
+                if not block:
+                    return
+                skip -= len(block)
+            continue
+        chunk = stream.read(size)
+        pending += chunk
+        if len(chunk) < size:
+            if pending and not dropping:
+                yield bytes(pending)
+            return
+        if len(pending) > limit_bytes:
+            if not dropping:
+                log(f"utterance longer than {limit_bytes} bytes, dropping it")
+                dropping = True
+            pending = bytearray()
+
+
+def write_wav(path: Path, audio: bytes, rate: int, log) -> None:
+    if len(audio) % 2:
+        log("dropping a trailing odd byte from the capture")
+        audio = audio[:-1]
+    with wave.open(str(path), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(rate)
+        out.writeframes(audio)
+
+
+def run_whisper(config: Config, wav: Path, work_dir: Path) -> str:
+    """Run the configured whisper command and return its transcript ('' when
+    it failed or heard nothing)."""
+    command = config.whisper
+    for placeholder, value in (("%wav", str(wav)), ("%dir", str(work_dir))):
+        command = command.replace(placeholder, shlex.quote(value))
+    if "%wav" not in config.whisper:
+        command = f"{command} {shlex.quote(str(wav))}"
+    try:
+        done = subprocess.run(
+            ["/bin/sh", "-c", command],
+            cwd=str(work_dir),
+            capture_output=True,
+            timeout=config.timeout,
+        )
+    except subprocess.TimeoutExpired:
+        config.log(f"whisper timed out after {config.timeout:g}s")
+        return ""
+    if done.returncode != 0:
+        detail = done.stderr.decode("utf-8", "replace").strip().splitlines()
+        tail = detail[-1] if detail else ""
+        config.log(f"whisper exited {done.returncode}: {tail}")
+        return ""
+    text = done.stdout.decode("utf-8", "replace").strip()
+    if not text:
+        for candidate in (work_dir / f"{wav.stem}.txt", work_dir / f"{wav.name}.txt"):
+            if candidate.is_file():
+                text = candidate.read_text(encoding="utf-8", errors="replace").strip()
+                break
+    return text
+
+
+def normalise_transcript(text: str) -> str:
+    """One line, no surrounding space: a newline typed into a shell would
+    submit whatever came before it, which is not what dictating a sentence
+    should do."""
+    return " ".join(text.split())
+
+
+def default_tmux_socket() -> Path:
+    """Where tmux looks for its socket when it is not given ``-S``:
+    ``$TMUX_TMPDIR/tmux-<uid>/default``, falling back to ``$TMPDIR`` and then
+    ``/tmp`` for the base directory, exactly as tmux(1) does (verified against
+    tmux 3.6a). Used to report which socket the helper tried when tmux cannot
+    connect, and as the last auto-detection candidate.
+    """
+    base = os.environ.get("TMUX_TMPDIR") or tempfile.gettempdir()
+    return Path(base) / f"tmux-{os.getuid()}" / "default"
+
+
+def socket_candidates(config: Config) -> list:
+    """Socket paths the tmux server could be on, most specific first.
+
+    tmux derives its own socket from ``$TMUX_TMPDIR``/``$TMPDIR``/``/tmp``, none
+    of which this SSH channel necessarily shares with the interactive login -
+    a server started from a login whose ``TMUX_TMPDIR`` was the systemd runtime
+    directory is the case that prompted this. So the candidates are the session
+    tmux is actually in (``$TMUX``), then each base directory tmux could have
+    been given, then tmux's own default.
+    """
+    if config.tmux_socket:
+        return [config.tmux_socket]
+    candidates = []
+    session = os.environ.get("TMUX")
+    if session:
+        # TMUX is "<socket path>,<server pid>,<session id>".
+        candidates.append(session.split(",", 1)[0])
+    bases = []
+    for name in ("TMUX_TMPDIR", "TMPDIR", "XDG_RUNTIME_DIR"):
+        base = os.environ.get(name)
+        if base and base not in bases:
+            bases.append(base)
+    bases.append(tempfile.gettempdir())
+    for base in bases:
+        candidate = str(Path(base) / f"tmux-{os.getuid()}" / "default")
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def tmux_socket(config: Config) -> str:
+    """The socket path a tmux failure should be reported against: the resolved
+    one, the configured one, or tmux's own default.
+    """
+    return (
+        config.tmux_socket_used
+        or config.tmux_socket
+        or str(default_tmux_socket())
+    )
+
+
+def socket_hint() -> str:
+    """What to tell a user whose tmux socket could not be reached."""
+    return (
+        f"set `tmux_socket = <path>` in ~/.config/{PROGRAM}.conf (the path is "
+        "`tmux display-message -p '#{socket_path}'` inside your session), or "
+        "set TMUX_TMPDIR"
+    )
+
+
+def run_tmux(config: Config, args: list, what: str):
+    """Run one tmux command, returning ``(ok, message)``. The message on
+    failure names the socket that was tried and what to do about it.
+    """
+    command = ["tmux"]
+    if config.tmux_socket_used:
+        command += ["-S", config.tmux_socket_used]
+    command += args
+    try:
+        done = subprocess.run(command, capture_output=True)
+    except OSError as err:
+        return False, f"{what} failed: {err}"
+    if done.returncode == 0:
+        return True, ""
+    detail = done.stderr.decode("utf-8", "replace").strip().splitlines()
+    reason = detail[-1] if detail else f"exit {done.returncode}"
+    return False, (
+        f"{what} failed: {reason} [socket {tmux_socket(config)}] - {socket_hint()}"
+    )
+
+
+def start_tmux(config: Config) -> None:
+    """Resolve and check the tmux socket once at startup, so a wrong one is
+    reported as a warning before a recording is transcribed and thrown away.
+
+    An explicitly configured socket is used as given. Otherwise the candidates
+    tmux itself could have used are probed in turn and the first socket a server
+    actually answers on wins, so a server under a non-default ``TMUX_TMPDIR``
+    (the systemd runtime directory, typically) is found without configuration.
+    """
+    if shutil.which("tmux") is None:
+        config.log("warning: tmux is not installed on this server")
+        return
+    if config.tmux_socket:
+        config.tmux_socket_used = config.tmux_socket
+        ok, message = run_tmux(config, ["list-sessions"], "tmux list-sessions")
+        if not ok:
+            config.log(f"warning: {message}")
+        return
+    candidates = socket_candidates(config)
+    for candidate in candidates:
+        command = ["tmux", "-S", candidate, "list-sessions"]
+        try:
+            answered = subprocess.run(command, capture_output=True).returncode == 0
+        except OSError:
+            answered = False
+        if answered:
+            # Only a socket tmux would not have found on its own is worth
+            # passing: the default keeps the plain, unqualified `tmux` calls.
+            if Path(candidate) != default_tmux_socket():
+                config.tmux_socket_used = candidate
+                config.log(f"using tmux socket {candidate}")
+            return
+    config.log(
+        "warning: no tmux server answered on "
+        + ", ".join(candidates)
+        + f" - {socket_hint()}"
+    )
+
+
+def type_into_tmux(config: Config, text: str) -> bool:
+    if shutil.which("tmux") is None:
+        config.log("tmux is not installed on this server")
+        return False
+    # A trailing space is deliberate: consecutive dictations then read as
+    # separate words instead of running together. Leading dashes are safe
+    # because `--` ends tmux's option parsing, and `-l` sends the text
+    # literally rather than interpreting key names.
+    args = ["send-keys"]
+    if config.tmux_target:
+        args += ["-t", config.tmux_target]
+    args += ["-l", "--", text + " "]
+    ok, message = run_tmux(config, args, "tmux send-keys")
+    if not ok:
+        config.log(message)
+        return False
+    if config.enter:
+        enter_args = ["send-keys"]
+        if config.tmux_target:
+            enter_args += ["-t", config.tmux_target]
+        enter_args += ["Enter"]
+        ok, message = run_tmux(config, enter_args, "tmux send-keys Enter")
+        if not ok:
+            config.log(message)
+            return False
+    return True
+
+
+def transcribe_utterance(config: Config, audio: bytes, keep_audio) -> None:
+    if not audio:
+        # `read_utterances` does not produce empty utterances, so this only
+        # guards a direct caller.
+        return
+    if keep_audio is not None:
+        work_dir = Path(keep_audio)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix="utt-", dir=str(work_dir)))
+    else:
+        work_dir = Path(tempfile.mkdtemp(prefix=f"{PROGRAM}-"))
+    try:
+        wav = work_dir / WAV_NAME
+        write_wav(wav, audio, config.rate, config.log)
+        text = normalise_transcript(run_whisper(config, wav, work_dir))
+        if not text:
+            config.log("no transcript")
+            return
+        if type_into_tmux(config, text):
+            config.log(f"typed {len(text)} characters")
+    finally:
+        if keep_audio is None:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        else:
+            config.log(f"kept audio in {work_dir}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=PROGRAM,
+        description="Transcribe PicoCalc push-to-talk audio from stdin into a tmux pane.",
+        epilog=(
+            "Example whisper commands:\n"
+            "  whisper-cli -m ~/models/ggml-base.en.bin -f %wav -nt -np\n"
+            "  whisper %wav --model base --output_format txt --output_dir %dir"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--whisper",
+        metavar="COMMAND",
+        help="shell command that transcribes %%wav (see the epilog); "
+        "defaults to $PICOCALC_PTT_WHISPER, the config file, or - with none of "
+        "those - whisper-cli with a discovered model (or openai-whisper)",
+    )
+    parser.add_argument(
+        "--tmux-target",
+        metavar="TARGET",
+        help="tmux target pane/session (default: tmux's own default target, "
+        "the most recently used session)",
+    )
+    parser.add_argument(
+        "--tmux-socket",
+        metavar="PATH",
+        help="tmux server socket, used as `tmux -S PATH` (default: tmux's own "
+        "socket, e.g. $TMUX_TMPDIR/tmux-$(id -u)/default; see "
+        "`tmux display-message -p '#{socket_path}'` inside your session)",
+    )
+    parser.add_argument(
+        "--enter",
+        dest="enter",
+        action="store_true",
+        default=None,
+        help="also press Enter after typing the transcript",
+    )
+    parser.add_argument(
+        "--no-enter",
+        dest="enter",
+        action="store_false",
+        help="do not press Enter after typing the transcript",
+    )
+    parser.add_argument(
+        "--rate",
+        type=int,
+        help=f"capture sample rate in Hz; must match the device's ptt_rate "
+        f"(default {DEFAULT_RATE})",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        help=f"seconds to allow one transcription (default {DEFAULT_TIMEOUT:g})",
+    )
+    parser.add_argument("--log", metavar="FILE", help="append diagnostics to FILE")
+    parser.add_argument(
+        "--config", metavar="FILE", help=f"config file to read (default ~/.config/{PROGRAM}.conf)"
+    )
+    parser.add_argument(
+        "--save-audio",
+        metavar="DIR",
+        help="keep each utterance's WAV under DIR instead of deleting it",
+    )
+    parser.add_argument("--version", action="version", version=f"{PROGRAM} 1.0")
+    return parser
+
+
+def main(argv=None, stdin=None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        config = resolve_config(args)
+    except (ValueError, OSError) as err:
+        print(f"{PROGRAM}: {err}", file=sys.stderr, flush=True)
+        return 2
+    stream = stdin if stdin is not None else sys.stdin.buffer
+    limit = int(MAX_UTTERANCE_SECONDS * config.rate) * 2
+    config.log(f"listening at {config.rate} Hz, whisper `{config.whisper}`")
+    start_tmux(config)
+    for audio in read_utterances(stream, limit, config.log):
+        transcribe_utterance(config, audio, args.save_audio)
+    config.log("session ended")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

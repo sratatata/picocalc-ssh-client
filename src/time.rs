@@ -60,7 +60,7 @@ impl UnixTime {
             Ok(time) => {
                 let elapsed = time.instant.elapsed();
 
-                let mut seconds = time.unix.seconds.saturating_add(elapsed.as_secs() as u64);
+                let mut seconds = time.unix.seconds.saturating_add(elapsed.as_secs());
                 let remainder = elapsed - Duration::from_secs(elapsed.as_secs());
                 let mut useconds = time
                     .unix
@@ -83,6 +83,11 @@ impl UnixTime {
         DateTime::from_timestamp(self.seconds as i64, self.useconds * 1000)
             .expect("failed to map UnixTime to chrono")
     }
+}
+
+/// Formats the current unix time as an RFC 3339 timestamp.
+pub fn current_rfc3339() -> Rfc3339 {
+    Rfc3339(UnixTime::now().as_chrono())
 }
 
 pub struct Rfc3339(pub DateTime<Utc>);
@@ -214,10 +219,9 @@ pub async fn time_sync(stack: Stack<'static>) {
                         let now = Instant::now();
                         TIME.get().lock().await.update_from_ntp(now, time);
 
-                        let now_ts = UnixTime::now();
-                        let rfc3339 = Rfc3339(now_ts.as_chrono());
+                        let rfc3339 = current_rfc3339();
 
-                        let offset = Duration::from_micros(time.offset.abs() as u64);
+                        let offset = Duration::from_micros(time.offset.unsigned_abs());
                         if first {
                             first = false;
                             print!("The time is {rfc3339}\r\n");
@@ -252,7 +256,5 @@ pub async fn time_sync(stack: Stack<'static>) {
 }
 
 pub async fn time_command(_args: &[&str]) {
-    let now_ts = UnixTime::now();
-    let rfc3339 = Rfc3339(now_ts.as_chrono());
-    print!("The time is {rfc3339}\r\n");
+    print!("The time is {}\r\n", current_rfc3339());
 }

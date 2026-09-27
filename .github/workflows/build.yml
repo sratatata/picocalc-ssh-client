@@ -1,20 +1,61 @@
 name: Build
 
 on:
-  push:
-    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v0.3)"
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build:
+  determine-version:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+    - name: Determine next artifact iteration
+      id: version
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const marker = "<!-- picocalc-uf2-artifacts -->";
+          const prNumber = context.payload.pull_request.number;
+
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+          });
+          const existing = comments.find(c => c.body.includes(marker));
+
+          let version = 1;
+          const match = existing?.body.match(/UF2 build artifacts — v(\d+)/);
+          if (match) {
+            version = parseInt(match[1], 10) + 1;
+          }
+          core.setOutput("version", version);
+
+  build-pr:
+    if: github.event_name == 'pull_request'
+    needs: determine-version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        chip: [pico2w, pimoroni2w]
+    env:
+      ARTIFACT_NAME: picocalc-ssh-client-${{ matrix.chip }}-pr${{ github.event.pull_request.number }}-v${{ needs.determine-version.outputs.version }}
 
     steps:
     - uses: actions/checkout@v4
@@ -30,19 +71,117 @@ jobs:
         cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
         make
     - name: Build
-      run: make image
+      run: make CHIP=${{ matrix.chip }} image
+    - name: Rename artifact
+      run: mv picocalc-ssh-client-${{ matrix.chip }}-*.uf2 ${{ env.ARTIFACT_NAME }}.uf2
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        path: "wezterm-*.uf2"
-    - name: zip for dev release
-      # Use a singular (non-version-dependent) name so that we don't need to
-      # wrange retention processing in the release
-      run: 7z a -tzip wezterm-picocalc.zip wezterm-*.uf2
-    - name: Upload Release Asset
-      uses: softprops/action-gh-release@v2
-      if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        name: ${{ env.ARTIFACT_NAME }}
+        path: ${{ env.ARTIFACT_NAME }}.uf2
+
+  comment-pr:
+    if: github.event_name == 'pull_request'
+    needs: [determine-version, build-pr]
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+    - name: Comment UF2 artifact links
+      uses: actions/github-script@v7
       with:
-        tag_name: dev
-        files: |
-          wezterm-picocalc.zip
+        script: |
+          const marker = "<!-- picocalc-uf2-artifacts -->";
+          const prNumber = context.payload.pull_request.number;
+          const version = "${{ needs.determine-version.outputs.version }}";
+          const suffix = `-pr${prNumber}-v${version}`;
+
+          const { data: { artifacts } } = await github.rest.actions.listWorkflowRunArtifacts({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: context.runId,
+          });
+
+          const relevant = artifacts
+            .filter(a => a.name.endsWith(suffix))
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+          const links = relevant
+            .map(a => {
+              const chip = a.name.slice("picocalc-ssh-client-".length, a.name.length - suffix.length);
+              return `- [v${version} - ${chip}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${a.id})`;
+            })
+            .join("\n");
+
+          const body = `${marker}\n### 📦 UF2 build artifacts — v${version}\n\n${links}\n\n(Updated for the latest push to this PR.)`;
+
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: prNumber,
+          });
+          const existing = comments.find(c => c.body.includes(marker));
+
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existing.id,
+              body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body,
+            });
+          }
+
+  build-release:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        chip: [pico2w, pimoroni2w]
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: Prepare
+      run: |
+        rustup +nightly target add thumbv8m.main-none-eabihf
+        cargo install flip-link
+        export PICO_SDK_PATH=$PWD/pico-sdk
+        mkdir -p picotool/build
+        cd picotool/build
+        cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
+        make
+    - name: Build
+      run: make CHIP=${{ matrix.chip }} image
+    - name: Rename artifact
+      run: mv picocalc-ssh-client-${{ matrix.chip }}-*.uf2 picocalc-ssh-client-${{ matrix.chip }}-${{ github.event.inputs.version }}.uf2
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: picocalc-ssh-client-${{ matrix.chip }}-${{ github.event.inputs.version }}
+        path: picocalc-ssh-client-${{ matrix.chip }}-${{ github.event.inputs.version }}.uf2
+
+  publish-release:
+    if: github.event_name == 'workflow_dispatch'
+    needs: build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    - name: Create release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.event.inputs.version }}
+        name: ${{ github.event.inputs.version }}
+        files: artifacts/**/*.uf2

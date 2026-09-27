@@ -68,6 +68,10 @@ impl Storage {
     }
 }
 
+async fn print_sd_card_error(err: impl core::fmt::Debug) {
+    print!("\u{1b}[1mSD Card error: {err:?}\u{1b}[0m\r\n");
+}
+
 async fn check_card(sd_detect: &Input<'_>) {
     let sd_is_present = sd_detect.get_level() == Level::Low;
     let mut storage = STORAGE.get().lock().await;
@@ -96,7 +100,7 @@ async fn check_card(sd_detect: &Input<'_>) {
                     storage.mark_loaded(volume_mgr);
                 }
                 Err(err) => {
-                    print!("\u{1b}[1mSD Card error: {err:?}\u{1b}[0m\r\n",);
+                    print_sd_card_error(err).await;
                 }
             }
         }
@@ -117,7 +121,7 @@ async fn check_card(sd_detect: &Input<'_>) {
                     }
                     Err(err) => {
                         *storage = Storage::Unplugged(volmgr);
-                        print!("\u{1b}[1mSD Card error: {err:?}\u{1b}[0m\r\n",);
+                        print_sd_card_error(err).await;
                     }
                 }
             }
@@ -171,7 +175,7 @@ pub async fn init_storage(
                 print!("SD card {}, {volumes}\r\n", byte_size(size));
             }
             Err(err) => {
-                print!("\u{1b}[1mSD Card error: {err:?}\u{1b}[0m\r\n",);
+                print_sd_card_error(err).await;
             }
         },
     }

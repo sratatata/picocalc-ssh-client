@@ -1,0 +1,7 @@
+# Per-repo no-mistakes overrides.
+
+# GitHub Actions has never run in this repo (workflow shows "active" but zero
+# runs, matching GitHub's default of disabling Actions on a forked repo until
+# the owner enables them). Until Actions is enabled, no-mistakes' CI step has
+# nothing to observe and waits until timeout. Disable CI validation until then.
+no_ci: true

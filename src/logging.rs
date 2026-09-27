@@ -86,7 +86,7 @@ impl log::Log for Logger {
     /// Logs to both usb and the serial connection
     fn log(&self, record: &Record<'_>) {
         self.usb_logger.log(record);
-        let _ = write!(Writer(&self.pipe), "{}\n", record.args());
+        let _ = writeln!(Writer(&self.pipe), "{}", record.args());
     }
     fn flush(&self) {
         self.usb_logger.flush();
@@ -99,13 +99,13 @@ impl<'d, const N: usize> Writer<'d, N> {
     fn write_slice(&mut self, b: &[u8]) {
         // The Pipe is implemented in such way that we cannot
         // write across the wraparound discontinuity.
-        if let Ok(n) = self.0.try_write(b) {
-            if n < b.len() {
-                // We wrote some data but not all, attempt again
-                // as the reason might be a wraparound in the
-                // ring buffer, which resolves on second attempt.
-                let _ = self.0.try_write(&b[n..]);
-            }
+        if let Ok(n) = self.0.try_write(b)
+            && n < b.len()
+        {
+            // We wrote some data but not all, attempt again
+            // as the reason might be a wraparound in the
+            // ring buffer, which resolves on second attempt.
+            let _ = self.0.try_write(&b[n..]);
         }
     }
 }

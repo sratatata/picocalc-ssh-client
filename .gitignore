@@ -4,3 +4,4 @@
 **/result
 **/target
 *.uf2
+__pycache__/

@@ -4,7 +4,7 @@
 
 use crate::config::{CONFIG, Flash};
 use crate::heap::{HEAP, init_qmi_psram_heap};
-use crate::psram::{init_psram, init_psram_qmi};
+use crate::psram::init_psram_qmi;
 use crate::screen::SCREEN;
 use crate::storage::init_storage;
 use core::cell::RefCell;
@@ -13,7 +13,7 @@ use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
 use embassy_executor::Spawner;
 use embassy_rp::block::ImageDef;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::{PIO0, PIO1, SPI1, TRNG, UART0, UART1, USB};
+use embassy_rp::peripherals::{PIO0, PIO1, PIO2, SPI1, TRNG, UART0, UART1, USB};
 use embassy_rp::spi::Spi;
 use embassy_rp::uart::BufferedInterruptHandler;
 use embassy_rp::watchdog::Watchdog;
@@ -48,18 +48,18 @@ macro_rules! print {
     }
 }
 
-use crate::screen::PicoCalcDisplay;
-
 mod config;
 mod fixed_str;
 mod heap;
 mod keyboard;
 mod logging;
+mod mic;
 mod net;
 mod process;
 mod psram;
 mod rng;
 mod screen;
+mod sshkey;
 mod storage;
 mod time;
 
@@ -86,6 +86,7 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<USB>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
     PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO1>;
+    PIO2_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO2>;
     I2C1_IRQ => embassy_rp::i2c::InterruptHandler<embassy_rp::peripherals::I2C1>;
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     UART1_IRQ => BufferedInterruptHandler<UART1>;
@@ -121,7 +122,7 @@ fn get_max_usable_stack() -> usize {
         static mut _stack_start: u8;
     }
 
-    let start_ptr = &raw mut _stack_start as *mut u8 as usize;
+    let start_ptr = &raw mut _stack_start as usize;
     start_ptr - 0x20000000 /* where RAM starts in memory.x */
 }
 
@@ -203,8 +204,20 @@ async fn main(spawner: Spawner) {
     let rst = Output::new(rst, Level::Low);
     // dcx: 0 = command, 1 = data
 
-    // display interface abstraction from SPI and DC
-    const DISPLAY_BUFFER_SIZE: usize = 320 * 3 * 320;
+    // Display interface abstraction from SPI and DC.
+    //
+    // This is the interface's SPI *batching* buffer, not a framebuffer:
+    // mipidsi's `SpiInterface` only requires it to hold at least one pixel and
+    // uses it to group pixels into larger SPI writes (its docs say "the buffer
+    // should be at least big enough to hold a few pixels"). A full-frame buffer
+    // therefore buys transfer speed only, at a large RAM cost - and that RAM is
+    // shared with the executor stack, because flip-link places `.bss` directly
+    // above it. The push-to-talk work's static `.bss` grew enough to shrink
+    // that stack below what the deep SSH connect path needs; this 64-pixel-row
+    // batch is the load-bearing knob that restores the headroom (sizes and the
+    // measured stack region are in AGENTS.md). Keep screen updates fast without
+    // surrendering that headroom.
+    const DISPLAY_BUFFER_SIZE: usize = 320 * 3 * 64;
     static DISPLAY_BUFFER: StaticCell<[u8; DISPLAY_BUFFER_SIZE]> = StaticCell::new();
     let di = SpiInterface::new(
         display_spi,
@@ -226,10 +239,14 @@ async fn main(spawner: Spawner) {
     let flash = Flash::new(p.FLASH, p.DMA_CH3);
     CONFIG.get().lock().await.assign_flash(flash);
 
-    let psram = init_psram(
-        p.PIO1, p.PIN_21, p.PIN_2, p.PIN_3, p.PIN_20, p.DMA_CH1, p.DMA_CH2,
-    )
-    .await;
+    // PIN_20 (RAM_CS) used to be driven by the slow bit-banged PSRAM path
+    // below; now that nothing drives it, hold it explicitly deselected
+    // (push-pull high, not just relying on the board's passive pull-up)
+    // so the PSRAM chip can't answer stray clocks on the pins we now drive
+    // as I2S (see psram.rs's header comment). Bound here and never dropped,
+    // since `main` never returns, so this stays driven for the firmware's
+    // whole lifetime.
+    let _psram_cs_deselect = Output::new(p.PIN_20, Level::High);
 
     let psram_qmi_size = init_psram_qmi(&embassy_rp::pac::QMI, &embassy_rp::pac::XIP_CTRL);
     if psram_qmi_size > 0 {
@@ -241,15 +258,9 @@ async fn main(spawner: Spawner) {
             "RAM {} avail of 520KiB\r\n",
             byte_size(get_max_usable_stack()),
         );
-        print!(
-            "PSRAM: {} (SLOW), {} (QMI)\r\n",
-            byte_size(psram.size),
-            byte_size(psram_qmi_size),
-        );
-        if psram.size == 0 {
-            // This can happen if you power on the pico without first
-            // powering up the picocalc carrier board
-            print!("\u{1b}[1mExternal PSRAM was NOT found!\u{1b}[0m\r\n");
+        print!("PSRAM (QMI): {}\r\n", byte_size(psram_qmi_size));
+        if psram_qmi_size == 0 {
+            print!("PSRAM heap: none - running from internal RAM only\r\n");
         }
         print!(
             "Heap {} used, {} free\r\n",
@@ -263,11 +274,17 @@ async fn main(spawner: Spawner) {
     )
     .await;
 
+    crate::mic::init_mic(&spawner, p.PIO2, p.PIN_2, p.PIN_3, p.PIN_21, p.DMA_CH4);
+
     // Load scrollback config
-    if let Ok(Some(val_str)) = CONFIG.get().lock().await.fetch("scroll").await {
-        if let Ok(val) = val_str.parse::<usize>() {
-            crate::screen::SCREEN.get().lock().await.set_max_scrollback(val);
-        }
+    if let Ok(Some(val_str)) = CONFIG.get().lock().await.fetch("scroll").await
+        && let Ok(val) = val_str.parse::<usize>()
+    {
+        crate::screen::SCREEN
+            .get()
+            .lock()
+            .await
+            .set_max_scrollback(val);
     }
 
     crate::net::setup_wifi(
@@ -286,7 +303,7 @@ macro_rules! mk_static {
     ($t:ty,$val:expr) => {{
         static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
         #[deny(unused_attributes)]
-        let x = STATIC_CELL.uninit().write(($val));
+        let x = STATIC_CELL.uninit().write($val);
         x
     }};
 }
